@@ -9,6 +9,7 @@ use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use http::HeaderValue;
@@ -21,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::instrument;
+use url::Url;
 
 pub struct ChatCompletionsClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -47,7 +49,7 @@ impl<T: HttpTransport> ChatCompletionsClient<T> {
         &self,
         request: ResponsesApiRequest,
     ) -> Result<ResponseStream, ApiError> {
-        let body = chat_request_from_responses_request(request)?;
+        let body = chat_request_from_responses_request(request, &self.session.provider().base_url)?;
         let body = EncodedJsonBody::encode(&body).map_err(|e| {
             ApiError::Stream(format!("failed to encode chat completions request: {e}"))
         })?;
@@ -95,7 +97,16 @@ struct ChatCompletionsRequest {
     tool_choice: String,
     #[serde(skip_serializing_if = "is_false")]
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ChatReasoning>,
     stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,7 +140,18 @@ struct ChatToolCallFunction {
 
 fn chat_request_from_responses_request(
     request: ResponsesApiRequest,
+    provider_base_url: &str,
 ) -> Result<ChatCompletionsRequest, ApiError> {
+    // Preserve the caller's explicit effort without forwarding Responses-only
+    // summary/context controls. OpenRouter documents a nested reasoning object;
+    // ordinary OpenAI-compatible providers use reasoning_effort instead.
+    let effort = request.reasoning.and_then(|reasoning| reasoning.effort);
+    let (reasoning_effort, reasoning) =
+        if Url::parse(provider_base_url).is_ok_and(|url| url.host_str() == Some("openrouter.ai")) {
+            (None, effort.map(|effort| ChatReasoning { effort }))
+        } else {
+            (effort, None)
+        };
     let mut tools = request
         .tools
         .unwrap_or_default()
@@ -251,6 +273,8 @@ fn chat_request_from_responses_request(
         tools: (!tools.is_empty()).then_some(tools),
         tool_choice: request.tool_choice,
         parallel_tool_calls: request.parallel_tool_calls,
+        reasoning_effort,
+        reasoning,
         stream: true,
     })
 }
